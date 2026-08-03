@@ -62,7 +62,7 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
 
                 if (series is not null)
                 {
-                    var remoteResult = MapTvShowToRemoteSearchResult(series);
+                    var remoteResult = MapTvShowToRemoteSearchResult(series, searchInfo);
 
                     return new[] { remoteResult };
                 }
@@ -126,7 +126,7 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
             return remoteResults;
         }
 
-        private RemoteSearchResult MapTvShowToRemoteSearchResult(TvShow series)
+        private RemoteSearchResult MapTvShowToRemoteSearchResult(TvShow series, SeriesInfo search)
         {
             var remoteResult = new RemoteSearchResult
             {
@@ -143,6 +143,8 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
 
                 remoteResult.TrySetProviderId(MetadataProvider.Tvdb, series.ExternalIds.TvdbId);
             }
+
+            WithDisplayOrder(series, remoteResult, search);
 
             remoteResult.PremiereDate = series.FirstAirDate?.ToUniversalTime();
             remoteResult.ProductionYear = series.FirstAirDate?.Year;
@@ -228,7 +230,7 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
 
             result = new MetadataResult<Series>
             {
-                Item = MapTvShowToSeries(tvShow, info.MetadataCountryCode),
+                Item = MapTvShowToSeries(tvShow, info.MetadataCountryCode, info),
                 ResultLanguage = info.MetadataLanguage ?? tvShow.OriginalLanguage
             };
 
@@ -242,7 +244,7 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
             return result;
         }
 
-        private static Series MapTvShowToSeries(TvShow seriesResult, string preferredCountryCode)
+        private static Series MapTvShowToSeries(TvShow seriesResult, string preferredCountryCode, SeriesInfo search)
         {
             var series = new Series
             {
@@ -256,10 +258,19 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
 
             series.Overview = seriesResult.Overview;
 
+            var studios = Enumerable.Empty<string>();
+
             if (seriesResult.Networks is not null)
             {
-                series.Studios = seriesResult.Networks.Select(i => i.Name).ToArray();
+                studios = studios.Concat(seriesResult.Networks.Select(i => i.Name).OfType<string>());
             }
+
+            if (seriesResult.ProductionCompanies is not null)
+            {
+                studios = studios.Concat(seriesResult.ProductionCompanies.Select(i => i.Name).OfType<string>());
+            }
+
+            series.SetStudios(studios);
 
             if (seriesResult.Genres is not null)
             {
@@ -320,19 +331,34 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
 
             if (seriesResult.Videos?.Results is not null)
             {
-                foreach (var video in seriesResult.Videos.Results)
+                var trailers = new List<MediaUrl>();
+
+                var sortedVideos = seriesResult.Videos.Results
+                    .OrderByDescending(video => string.Equals(video.Type, "trailer", StringComparison.OrdinalIgnoreCase));
+
+                foreach (var video in sortedVideos)
                 {
-                    if (TmdbUtils.IsTrailerType(video))
+                    if (!TmdbUtils.IsTrailerType(video))
                     {
-                        series.AddTrailerUrl("https://www.youtube.com/watch?v=" + video.Key);
+                        continue;
                     }
+
+                    trailers.Add(new MediaUrl
+                    {
+                        Url = string.Format(CultureInfo.InvariantCulture, "https://www.youtube.com/watch?v={0}", video.Key),
+                        Name = video.Name
+                    });
                 }
+
+                series.RemoteTrailers = trailers;
             }
 
             if (!string.IsNullOrEmpty(seriesResult.OriginalLanguage))
             {
                 series.OriginalLanguage = seriesResult.OriginalLanguage;
             }
+
+            WithDisplayOrder(seriesResult, series, search);
 
             return series;
         }
@@ -417,12 +443,71 @@ namespace MediaBrowser.Providers.Plugins.Tmdb.TV
                     yield return personInfo;
                 }
             }
+
+            if (seriesResult.CreatedBy is not null)
+            {
+                foreach (var person in seriesResult.CreatedBy)
+                {
+                    if (string.IsNullOrWhiteSpace(person.Name))
+                    {
+                        continue;
+                    }
+
+                    var personInfo = new PersonInfo
+                    {
+                        Name = person.Name.Trim(),
+                        Type = PersonKind.Creator,
+                        ImageUrl = _tmdbClientManager.GetProfileUrl(person.ProfilePath)
+                    };
+
+                    if (person.Id > 0)
+                    {
+                        personInfo.SetProviderId(MetadataProvider.Tmdb, person.Id.ToString(CultureInfo.InvariantCulture));
+                    }
+
+                    yield return personInfo;
+                }
+            }
         }
 
         /// <inheritdoc />
         public Task<HttpResponseMessage> GetImageResponse(string url, CancellationToken cancellationToken)
         {
             return _httpClientFactory.CreateClient(NamedClient.Default).GetAsync(url, cancellationToken);
+        }
+
+        private static TvGroupType? MapDisplayOrderToTvGroupType(string? displayOrder)
+        {
+            return displayOrder switch
+            {
+                "originalAirDate" => TvGroupType.OriginalAirDate,
+                "absolute" => TvGroupType.Absolute,
+                "dvd" => TvGroupType.DVD,
+                "digital" => TvGroupType.Digital,
+                "storyArc" => TvGroupType.StoryArc,
+                "production" => TvGroupType.Production,
+                "tv" => TvGroupType.TV,
+                _ => null,
+            };
+        }
+
+        private static void WithDisplayOrder(TvShow searchResult, IHasProviderIds providerIds, SeriesInfo search)
+        {
+            if (!search.TryGetProviderId(TmdbEpisodeGroupId.ProviderKey, out var episodeGroupId)
+                && searchResult.EpisodeGroups?.Results is not null)
+            {
+                var tvGroupType = MapDisplayOrderToTvGroupType(search.DisplayOrder);
+                if (tvGroupType is not null)
+                {
+                    var episodeGroup = searchResult.EpisodeGroups.Results.Find(g => g.Type == tvGroupType);
+                    if (episodeGroup is not null)
+                    {
+                        episodeGroupId = episodeGroup.Id;
+                    }
+                }
+            }
+
+            providerIds.TrySetProviderId(TmdbEpisodeGroupId.ProviderKey, episodeGroupId);
         }
     }
 }
